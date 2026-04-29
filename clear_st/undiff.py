@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from SPUndiff.clear_model import CLEARmodel
+from clear_st.clear_model import CLEARmodel
 import pyro
 import torch.nn.functional as F
 

@@ -5,8 +5,8 @@ import os
 
 __version__ = '0.1'
 
-from SPUndiff.undiff import undiff
-from SPUndiff.clear_model import CLEARmodel
+from clear_st.undiff import undiff
+from clear_st.clear_model import CLEARmodel
 
 __all__ = [
     'undiff',

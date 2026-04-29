@@ -1,4 +1,4 @@
-# SPundiff / CLEARmodel
+# clear_st / CLEARmodel
 
 A Pyro + PyTorch implementation of a probabilistic spatial decontamination model
 that learns a denoising autoencoder for clean expression and a niche-aware,
@@ -30,7 +30,7 @@ python run_CLEARmodel.py --data_input /path/to/slide.h5ad --epochs 1000 --n_gene
 
 ```python
 import torch
-from SPUndiff.clear_model import CLEARmodel
+from clear_st.clear_model import CLEARmodel
 
 # Prepare tensors (examples):
 Y = torch.tensor(..., dtype=torch.float32)                 # (n_spots, n_genes)

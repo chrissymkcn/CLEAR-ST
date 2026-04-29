@@ -1,0 +1,413 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\title{CLEARmodel: Single-Scale Probabilistic Modeling of Spatial Transcriptomics Data}
+\author{GitHub Copilot}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+This document describes the end-to-end pipeline implemented in \texttt{SPUndiff}, focusing on:
+(i) data preprocessing (gene selection, adaptive thresholding via Moran's I, and optional cell segmentation),
+(ii) the CLEARmodel generative model (single-scale forward diffusion and full joint distribution),
+(iii) parameter initialization with biological and spatial intuitions,
+(iv) end-to-end pseudocode.
+
+We work with an AnnData object holding spot-wise expression $Y\in\mathbb{R}^{N\times G}$ and spatial coordinates. We aim to estimate spot-wise true in-tissue expression $X\in\mathbb{R}^{N\times G}$ while modeling spatial contamination via single-scale diffusion.
+
+\section{Bayesian model design}
+
+The generative model defines the joint distribution over observed expression $Y$, true expression $X$, and diffusion parameters $\delta$ (niche-specific diffusion fractions). The forward process models contamination as a single-scale spatial diffusion on a graph.
+
+\subsection{Full Joint Probability}
+
+Let $\Theta$ denote all parameters (niche diffusion fractions, kernel bandwidths, likelihood dispersions, regularization weights).
+
+The complete joint distribution is:
+\[
+p(Y, X, \delta \mid \Theta) = \underbrace{\prod_{g,s \in \mathcal{T}} p(X_{s,g} \mid \Theta)}_{\text{prior on true X}} \cdot \underbrace{\prod_{g} p(Y_{\cdot,g} \mid C_{\cdot,g}(X, \delta, \Theta))}_{\text{likelihood}} \cdot \underbrace{p(\delta \mid \Theta)}_{\text{priors on rates}},
+\]
+
+where:
+- $p(X_{s,g} \mid \Theta)$ is the chosen count likelihood (NB, Gamma-Poisson, etc.) with mean initialized near $X^{\text{init}}_{s,g}$.
+- $p(Y_{\cdot,g} \mid C_{\cdot,g}(\cdot))$ is the observation model linking contaminated counts to observed counts.
+- $p(\delta \mid \Theta)$ are Beta priors parameterized by the learned means and prior strength.
+
+Regularizers are encoded as log-factors: $-\phi_{\text{zero}}$ is added to the ELBO.
+
+\subsubsection{Prior on Diffusion Parameters}
+Spot-specific diffusion fractions $\delta_s \in [0,1]$ for $s=1,\dots,N$ spots:
+\[
+\delta_s \sim \text{Beta}(\alpha_s, \beta_s),
+\]
+where $\alpha_s = \alpha_0 \cdot \mu_{\delta,s}$, $\beta_s = \alpha_0 \cdot (1 - \mu_{\delta,s})$, with prior strength $\alpha_0 = 2.0$ and $\mu_{\delta,s}$ initialized from data (see Section~\ref{sec:init}).
+
+\subsubsection{Prior on True Expression}
+For tissue spots $\mathcal{T}$, true expression $X_{s,g}$ follows a count distribution with mean initialized near $X^{\text{init}}_{s,g}$. The default is Negative Binomial:
+\[
+X_{s,g} \sim \text{NB}(r_g, p_{s,g}), \quad p_{s,g} = \frac{r_g}{r_g + \mu_{s,g}}, \quad \mu_{s,g} = \softplus(X^{\text{init}}_{s,g}),
+\]
+where $r_g = 2.0$ (dispersion parameter, learned per gene). Alternatives include Gamma-Poisson, Poisson, or Zero-Inflated Poisson.
+
+For non-tissue spots, $X_{s,g} = 0$.
+
+\subsubsection{Forward Diffusion Process}
+
+The contamination model computes observed expression as a mixture of true expression and its diffused counterpart across the spatial tissue. We offer two complementary diffusion modes, controlled by the \texttt{use\_laplacian\_diffusion} flag, each providing distinct biological and computational interpretations.
+
+\paragraph{Core Contamination Formula}
+
+Regardless of diffusion mode, the final contaminated expression $C$ follows:
+\[
+C_{s,g} = (1 - r_s) \cdot X_{s,g} + r_s \cdot y_{s,g},
+\]
+where:
+\begin{itemize}
+  \item $X_{s,g}$ is the true in-tissue expression at spot $s$ for gene $g$.
+  \item $r_s \in [0, 1]$ is the spot-specific \textbf{release rate} or diffusion fraction $\delta_s$, learned from data via Beta prior.
+  \item $y_{s,g}$ is the diffused true expression, computed iteratively via the chosen diffusion mechanism.
+\end{itemize}
+
+Intuitively, $(1-r_s)$ retains the original spot's expression, while $r_s$ allocates mass to the diffused field. Higher $r_s$ indicates more contamination from neighboring spots.
+
+\paragraph{Mode 1: Markov Chain Diffusion (Default)}
+
+When \texttt{use\_laplacian\_diffusion = False}, contamination is modeled as discrete random walks on the spatial graph.
+
+\textbf{Setup:}
+Let $P \in \mathbb{R}^{N \times N}$ be a column-stochastic transition matrix derived from the spatial adjacency structure:
+\[
+P_{ij} = \frac{w_{ij}}{\sum_i w_{ij}},
+\]
+where $w_{ij}$ is the Gaussian kernel weight between spots $i$ and $j$:
+\[
+w_{ij} = \begin{cases}
+\exp\left(-\frac{d_{ij}^2}{2\sigma^2}\right) & \text{if } (i,j) \in \mathcal{E} \text{ (spatial neighbors)}\\
+0 & \text{otherwise}.
+\end{cases}
+\]
+Here $d_{ij}$ is the Euclidean distance, $\sigma$ is the learned kernel bandwidth, and $\mathcal{E}$ is the adjacency structure (typically from $k$-NN or distance threshold).
+
+\textbf{Diffusion iteration:}
+Starting from $y^{(0)} = X$, we compute $n_{\text{steps}}$ iterations:
+\[
+y^{(k+1)} = (1 - \gamma) \cdot P y^{(k)} + \gamma \cdot \bar{y}^{(k)},
+\]
+where:
+\begin{itemize}
+  \item $P y^{(k)}$ spreads expression to spatial neighbors (random walk step).
+  \item $\bar{y}^{(k)} = \frac{1}{N}\sum_s y^{(k)}_{s,\cdot}$ is the uniform redistribution (global average per gene).
+  \item $\gamma \in [0, 1]$ is the \textbf{teleportation probability}, which controls mixing: high $\gamma$ adds uniform redistribution (faster mixing, more global contamination), low $\gamma$ emphasizes local neighbors.
+\end{itemize}
+
+Finally, set $y = y^{(n_{\text{steps}})}$.
+
+\textbf{Intuition:}
+The Markov chain models random walk-like diffusion where RNA molecules ``hop'' between adjacent spots with probability $P_{ij}$. The teleportation term prevents the random walk from getting stuck in local cycles and simulates long-range diffusion (e.g., via diffusion in free space or active transport). Each iteration corresponds to a time step, and $n_{\text{steps}}$ controls total diffusion time. The spot-specific rate $r_s$ then scales the final contribution of this diffused field.
+
+\textbf{Parameters:}
+\begin{itemize}
+  \item $P$: Normalized spatial adjacency (implicitly learned through kernel $\sigma$).
+  \item $\gamma$: Global teleportation parameter (scalar, in $[0,1]$).
+  \item $n_{\text{steps}}$: Number of diffusion iterations (default: 5).
+  \item $\sigma$: Gaussian kernel bandwidth (learned during initialization, fixed during training).
+\end{itemize}
+
+\paragraph{Mode 2: Laplacian Diffusion (Physics-Inspired)}
+
+When \texttt{use\_laplacian\_diffusion = True}, contamination is modeled as continuous diffusion via the graph Laplacian, analogous to the heat equation on a manifold.
+
+\textbf{Setup:}
+Construct the graph Laplacian from the spatial adjacency:
+\[
+L = D - W,
+\]
+where:
+\begin{itemize}
+  \item $D \in \mathbb{R}^{N \times N}$ is the diagonal degree matrix: $D_{ii} = \sum_j W_{ij}$.
+  \item $W \in \mathbb{R}^{N \times N}$ is the Gaussian kernel matrix: $W_{ij} = w_{ij}$ (row-normalized or unnormalized depending on convention).
+\end{itemize}
+
+The Laplacian $L$ is sparse (only nonzero where neighbors exist) and encodes local geometry: eigenvalues near zero correspond to smooth, global patterns, while large eigenvalues capture local high-frequency variation.
+
+\textbf{Diffusion iteration:}
+Starting from $y^{(0)} = X$, we evolve via:
+\[
+y^{(k+1)} = y^{(k)} - \text{dt} \cdot L y^{(k)} + \gamma \cdot (\bar{y}^{(k)} - y^{(k)}),
+\]
+where:
+\begin{itemize}
+  \item $\text{dt}$ is the time step size (default: 1.0, chosen for stability).
+  \item $L y^{(k)}$ is the diffusion gradient: positive at peak regions, negative at valleys, so $-\text{dt} \cdot L y^{(k)}$ smooths and spreads mass.
+  \item $\gamma \cdot (\bar{y}^{(k)} - y^{(k)})$ is a damping/teleportation term that pulls the field toward uniform distribution, preventing unbounded growth and ensuring mass conservation.
+\end{itemize}
+
+After $n_{\text{steps}}$ iterations, set $y = y^{(n_{\text{steps}})}$.
+
+\textbf{Intuition:}
+The Laplacian diffusion solves a semi-discrete version of the heat equation:
+\[
+\frac{\partial y}{\partial t} = -L y,
+\]
+which smooths the expression field by spreading mass from high-expression peaks to neighboring low-expression regions. This is more physically motivated than discrete random walks: it directly models molecular diffusion in continuous space approximated via the graph structure. The Laplacian is symmetric, so the diffusion preserves important topological structure (e.g., cluster boundaries fade gradually). The added damping term prevents artificial mass growth and maintains energy conservation.
+
+\textbf{Parameters:}
+\begin{itemize}
+  \item $L$: Graph Laplacian (sparse, computed once from $W$ and cached).
+  \item $\gamma$: Damping / teleportation coefficient (scalar, in $[0,1]$).
+  \item $\text{dt}$: Time step (fixed to 1.0 for unconditional stability).
+  \item $n_{\text{steps}}$: Number of diffusion steps (default: 5, controls total diffusion time).
+  \item $\sigma$: Gaussian kernel bandwidth (learned, determines locality of $W$ and hence $L$).
+\end{itemize}
+
+\paragraph{Comparison and Selection}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Aspect} & \textbf{Markov Chain} & \textbf{Laplacian} \\
+\hline
+\textbf{Model} & Discrete random walk & Continuous heat equation \\
+\hline
+\textbf{Physics} & Stochastic hopping & Deterministic smoothing \\
+\hline
+\textbf{Symmetry} & May be asymmetric ($P$ is row-stochastic) & Symmetric ($L$ is Hermitian) \\
+\hline
+\textbf{Efficiency} & $O(\text{nnz}(P)) \times n_{\text{steps}}$ & $O(\text{nnz}(L)) \times n_{\text{steps}}$ \\
+\hline
+\textbf{Sparsity} & Depends on adjacency; can be dense & Inherits adjacency sparsity \\
+\hline
+\textbf{Mass conservation} & Explicit (column-stochastic $P$) & Via damping term \\
+\hline
+\textbf{Boundary behavior} & Teleportation spreads globally & Damping prevents overspill \\
+\hline
+\textbf{Interpretability} & Clear: fraction of neighbors visited & Gradient-based: smoothness strength \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Recommendation:}
+\begin{itemize}
+  \item Use \textbf{Markov Chain} (default) for \textbf{maximum stability and interpretability}: the random walk model is well-studied, column-stochasticity guarantees mass conservation, and teleportation provides a tunable global mixing knob.
+  \item Use \textbf{Laplacian} for \textbf{physics-inspired smoothing} and when you expect \textbf{slow, smooth diffusion} across tissue (e.g., small molecules diffusing in extracellular space): the heat equation is more physically grounded, and the Laplacian respects tissue geometry.
+\end{itemize}
+
+\paragraph{Shared Parameters and Final Contamination}
+
+Regardless of diffusion mode, after computing $y$ via either method, we arrive at the final contamination:
+\[
+C_{s,g} = (1 - r_s) \cdot X_{s,g} + r_s \cdot y_{s,g}.
+\]
+
+The spot-specific release rate $r_s = \delta_s$ is shared across both modes and is learned during variational inference (guided by the Beta prior initialized from data). Both modes are applied the same spatial kernel (bandwidth $\sigma$), ensuring consistent geometry across methods.
+
+\subsubsection{Observation Model}
+Observed expression $Y_{s,g}$ given contaminated $C_{s,g}$:
+\[
+Y_{s,g} \sim \text{NB}(\tilde{r}_g, \tilde{p}_{s,g}), \quad \tilde{p}_{s,g} = \frac{\tilde{r}_g}{\tilde{r}_g + C_{s,g}},
+\]
+where $\tilde{r}_g$ is learned per gene. Alternatives: Gamma-Poisson $\lambda_{s,g} \sim \Gamma(\alpha_g, \beta_g)$, $Y_{s,g} \sim \text{Poisson}(\lambda_{s,g})$; Poisson $Y_{s,g} \sim \text{Poisson}(C_{s,g})$; Zero-Inflated Poisson.
+
+\subsection{Regularization}
+A zero-mask penalty discourages high $X$ at spots with $Y \approx 0$:
+\[
+\phi_{\text{zero}} = w_{\text{zero}} \cdot \frac{1}{|\mathcal{Z}|} \sum_{(s,g) \in \mathcal{Z}} X_{s,g}^p,
+\]
+where $\mathcal{Z} = \{(s,g) : Y_{s,g} \le \epsilon\}$, $p=2$, $w_{\text{zero}}=1000$. This is added as $-\phi_{\text{zero}}$ to the ELBO.
+
+To prevent model collapse and encourage biologically sensible solutions, we add two key regularizers:
+
+\subsubsection{Spatial Smoothness Penalty (Currently Disabled)}
+
+The implementation includes code for a spatial smoothness penalty using the graph Laplacian, but this is currently \textbf{commented out} in the model:
+
+\[
+\phi_{\text{smooth}} = \lambda_{\text{smooth}} \sum_{g=1}^{G} X_{\cdot,g}^{\top} L X_{\cdot,g},
+\]
+
+where $L = D - W$ would be the graph Laplacian constructed from local spatial weights. When enabled, this penalty would encourage neighboring spots to have similar true expression (high spatial autocorrelation). However, the current active model relies solely on the zero-mask penalty and the contamination structure to preserve spatial patterns.
+
+\subsubsection{Zero-Mask Penalty}
+
+We discourage the model from inferring high true expression at spots where observed expression is (near) zero:
+
+\[
+\phi_{\text{zero}} = w_{\text{zero}} \cdot \frac{1}{|\mathcal{Z}|} \sum_{(s,g) \in \mathcal{Z}} X_{s,g}^p,
+\]
+
+where $\mathcal{Z} = \{(s,g) : Y_{s,g} \le \epsilon_{\text{zero}}\}$ is the set of observed-zero entries, $p \in \{1,2\}$ is the violation power (L1 or L2), and $w_{\text{zero}}$ is the penalty weight (default: 1000). The normalization by $|\mathcal{Z}|$ makes the penalty scale-invariant.
+
+This regularizer prevents the model from absorbing all variance into contamination and from explaining observed zeros as technical noise rather than biological absence.
+
+\subsubsection{Implementation in Optimization}
+
+The zero-mask regularizer is incorporated as a log-factor in the ELBO (the spatial smoothness penalty is currently disabled):
+
+\[
+\text{ELBO}_{\text{regularized}} = \mathbb{E}_{q}\left[\log p(Y,X,\delta\mid\Theta)\right] - \mathbb{E}_{q}\left[\log q(X,\delta)\right] - \phi_{\text{zero}}.
+\]
+
+\subsection{Variational Inference}
+
+We use amortized variational inference with a factorized guide:
+\[
+q(X, \delta) = q(X) \cdot q(\delta).
+\]
+
+The guide for $X$ (on tissue spots) is a Negative Binomial or Gamma-Poisson distribution (matching the model's likelihood) with learned mean parameters $\mu^q_{s,g}$ and variance/dispersion. The guide for $\delta$ are Beta distributions with learned concentration parameters.
+
+The posterior mean of $X$ is extracted as:
+\[
+\mathbb{E}_q[X_{s,g}] = \text{posterior\_mean}_{s,g},
+\]
+which provides point estimates of true in-tissue expression after training.
+
+\subsection{Optimization Goal}
+
+We perform stochastic variational inference (SVI) on the evidence lower bound (ELBO):
+\[
+\mathcal{L}(\Theta, q) = \mathbb{E}_{q(X,\delta)}\left[\log p(Y, X, \delta \mid \Theta)\right] - \mathbb{E}_{q}\left[\log q(X, \delta)\right] - \phi_{\text{zero}}.
+\]
+
+We optimize jointly over:
+- **Model parameters** $\Theta$: spatial kernel bandwidths ($\sigma$), observation likelihood parameters, regularization weights.
+- **Variational parameters**: guide means and variances.
+
+**Optimization Details:**
+- **Optimizer**: Adam with learning rate scheduling (ReduceLROnPlateau).
+- **Gradient clipping**: Clip gradients to norm $\le 5.0$ to stabilize training.
+- **Early stopping**: Stop if ELBO does not improve for 50 consecutive epochs (default patience).
+- **Batch sampling**: Use 1–2 particles for ELBO estimation (Trace ELBO).
+
+The learned posterior mean $\mathbb{E}_q[X]$ on tissue spots serves as the decontaminated expression estimate, which is then rounded to integer counts and rescaled per-gene to match total true counts (mild rescaling by factor in $[0.7, 1.3]$).
+
+\section{Data Preprocessing}
+
+\subsection{Gene Selection}
+We select genes likely informative for decontamination by combining:
+\begin{itemize}
+  \item Highly variable genes from in-tissue and raw subsets (Scanpy \texttt{highly\_variable\_genes}).
+  \item Top genes by total counts in out-of-tissue spots until a target fraction of total out-of-tissue mass is covered (e.g. $>95\%$).
+  \item Exclusion of mitochondrial or deprecated gene families.
+\end{itemize}
+Concretely:
+\begin{align*}
+\mathcal{G}_{\text{HVG}} &= \text{HVGs(raw)} \cap \text{HVGs(in-tissue)},\\
+\mathcal{G}_{\text{out}}(i) &= \text{top-}i\text{ genes by } \sum_{\text{spots: out}} Y_{s,g},\\
+\text{Select smallest } i &: \frac{\sum_{g\in \mathcal{G}_{\text{out}}(i)} \sum_{\text{out }s} Y_{s,g}}{\sum_g \sum_{\text{out }s} Y_{s,g}} \ge 0.95,\\
+\mathcal{G} &= \left(\mathcal{G}_{\text{out}}(i) \cup \mathcal{G}_{\text{HVG}}\right)\setminus \text{(blacklist)}.
+\end{align*}
+
+\subsection{Adaptive Quantile Thresholding via Moran's I}
+Let $Y\in\mathbb{R}^{N\times G}$ and $M\in\{0,1\}^N$ be the in-tissue mask. For each gene $g$, we:
+\begin{enumerate}
+  \item Filter spots with $Y_{s,g}\ge \text{min\_expr}$ and at least \texttt{min\_spots}.
+  \item For a grid of quantiles $q\in [q_{\min}, q_{\max}]$, compute cutoff $c_g(q)=\text{Quantile}( \{Y_{s,g}\}_{Y_{s,g}\ge \text{min\_expr}}, q)$.
+  \item Define high-expression mask $H_g(q)=\{s: Y_{s,g} > c_g(q),\, M_s=1\}$ and compute Moran's I on $Y_{H_g(q),g}$ with row-normalized spatial weights $W$:
+  \[
+    I_g(q) \;=\; \frac{n}{S_0}\cdot \frac{\sum_{i}(z_i)(\sum_j W_{ij} z_j)}{\sum_i z_i^2 + \varepsilon}, \quad z_i = Y_{i,g} - \bar{Y}_g, \quad S_0=\sum_{i,j} W_{ij}.
+  \]
+  \item Pattern detection over $I_g(q)$: Apply Savitzky-Golay smoothing, then detect patterns via:
+  \begin{itemize}
+    \item \textbf{Monotonic decreasing tail}: If derivatives $dy \le \text{derivative\_tol}$ for at least \texttt{min\_monotonic\_span} consecutive points and no prominent peaks exist, select earliest such $q$.
+    \item \textbf{Peak detection}: Use \texttt{scipy.signal.find\_peaks} with \texttt{prominence} and \texttt{height} thresholds; if peaks exist, select the first peak.
+    \item \textbf{Fallback}: Select global maximum of smoothed curve; if maximum occurs at $q_{\max}$, revert to $q_{\min}$.
+  \end{itemize}
+\end{enumerate}
+We obtain per-gene invalid thresholds $c_g = c_g(q^\star_g)$, used to softly filter in/out contributions.
+
+
+\subsection{Optional Cell Segmentation}
+If enabled, we compute per-spot segmentation features (e.g., watershed on H\&E) and derive \texttt{in\_no\_cell} labels: 0 (out-tissue), 1 (in-tissue with at least one cell), 2 (in-tissue with no cells). This is later passed into $X_{\text{init}}$ computation and model to constrain dimension of latent true expression.
+
+\subsection{Initial Embeddings $X_{\text{init}}$}
+We initialize via spatial transport per gene:
+\[
+p_{\cdot,g}=\frac{\widehat{Y}^{\text{out}}_{\cdot,g}}{\sum_s \widehat{Y}^{\text{out}}_{s,g}},\quad
+q_{\cdot,g}=\frac{\widehat{Y}^{\text{in}}_{\cdot,g}}{\sum_s \widehat{Y}^{\text{in}}_{s,g}},\quad
+\Pi^{(g)}_{i\leftarrow j} \propto \frac{1}{1+D_{ij}}\cdot q_{i,g},\quad \text{row-normalize }\Pi^{(g)},
+\]
+\[
+\text{transported}_{\cdot,g} = \Pi^{(g)}\,p_{\cdot,g},\quad
+X^{\text{init}}_{\cdot,g} = \left(\sum_s \widetilde{Y}^{\text{out}}_{s,g}\right)\cdot \text{transported}_{\cdot,g} + \left(\sum_s \widetilde{Y}^{\text{in}}_{s,g}\right)\cdot \widehat{Y}^{\text{in}}_{\cdot,g}.
+\]
+where $\widehat{Y}^{\text{in}}$ and $\widetilde{Y}^{\text{out}}$ are the filtered in-tissue and out-of-tissue expression (soft-thresholded by per-gene cutoffs $c_g$), and $D_{ij}$ is the precomputed spatial distance cost matrix. Finally, round $X^{\text{init}}$ to integer counts while preserving column sums via a largest-remainder scheme.
+
+
+
+\section{Parameter Initialization and Intuitions}
+
+\subsection{Local Kernel Width $\sigma$}
+
+We initialize the spatial kernel bandwidth as the median of mean $k$-NN distances:
+\[
+\sigma = \text{median}_{\text{spots}}\left(\text{mean}_{k=1,\ldots,9}(d_{s,k\text{-NN}})\right),
+\]
+where $d_{s,k\text{-NN}}$ is the distance from spot $s$ to its $k$-th nearest neighbor. This captures the typical inter-spot spacing in the tissue.
+
+**Intuition**: Aligns with physical spot size and density for stable, interpretable diffusion.
+
+\subsection{Spot Diffusion Fractions}
+
+The prior mean for spot-level diffusion fractions is derived from niche-specific estimates of total contamination, scaled to per-step release rates.
+
+First, compute the global fraction of expression in background/no-cell spots:
+\[
+\text{total\_out\_perc} = 1 - \frac{\sum_{s \in \mathcal{T}} Y_{s,\cdot}}{\sum_{s} Y_{s,\cdot}}
+\]
+
+For each niche $k$, estimate the total diffusion fraction from observed contamination:
+\[
+\mu_{\text{total},\delta_k} = \text{clamp}\left( \frac{\sum_{\text{background spots influenced by } k} Y_{s,\cdot}}{\sum_{s \in \text{niche } k} Y_{s,\cdot}} \cdot \text{total\_out\_perc}, \min=0.01, \max=0.5 \right)
+\]
+
+Convert to per-step release rate (with $n_{\text{steps}}=5$):
+\[
+\mu_{\delta_k} = \frac{\mu_{\text{total},\delta_k}}{n_{\text{steps}}}
+\]
+
+Map to spots based on niche labels:
+\[
+\mu_{\delta_s} = \mu_{\delta_{\nu_s}}
+\]
+
+Spot diffusion fractions $\delta_s \in [0,1]$ follow:
+\[
+\delta_s \sim \text{Beta}(\alpha_s, \beta_s),
+\]
+where $\alpha_s = \alpha_0 \cdot \mu_{\delta_s}$, $\beta_s = \alpha_0 \cdot (1 - \mu_{\delta_s})$, with prior strength $\alpha_0 = 2.0$.
+
+**Intuition**: Estimates total niche contamination from data, scales to per-step rates for the diffusion operator. Prevents over-diffusion by grounding in observed patterns.
+
+\subsection{Likelihood Parameters}
+
+For each gene $g$ and likelihood type:
+- **Negative Binomial dispersion** $\tilde{r}_g$: initialized to $2.0$ (moderate overdispersion).
+- **Zero-inflation probability** $\pi_g$: initialized to $0.1$ to $0.2$ (mild excess zeros).
+
+These are learned per gene during training.
+
+\subsection{True Expression Prior Mean}
+
+The prior mean for latent true expression on tissue spots is initialized to:
+\[
+\mu_X = \softplus(X^{\text{init}}),
+\]
+ensuring positivity and mild smoothing.
+
+\subsection{Intuition: Why This Initialization Works}
+
+Grounding in biological and spatial statistics:
+1. **Reduces inference burden**: Starts near a reasonable solution.
+2. **Improves stability**: Prevents degenerate solutions.
+3. **Preserves interpretability**: Parameters in interpretable ranges.
+4. **Enables robustness**: Adapts to different datasets.
+
+\end{document}
